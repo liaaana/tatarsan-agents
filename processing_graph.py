@@ -5,12 +5,65 @@ from dataclasses import dataclass, asdict
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TypedDict
+
 from dotenv import load_dotenv
 from langgraph.graph import StateGraph, END
 
 from pydantic import BaseModel, Field
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_openai import ChatOpenAI
+
+import pandas as pd
+from docx import Document
+
+from yandex_ocr_client import recognize_file_to_text, YandexOcrError
+
+
+# ---------- 0. Загрузка ТУ ----------
+
+TU_DIR = Path(__file__).with_name("tu")
+
+
+def load_all_tu_configs() -> Dict[str, Dict[str, Any]]:
+    """
+    Загружаем все *.json из папки tu/ и строим словарь:
+    { tu_id: {"meta": {...}, "data": {...}} }
+    где tu_id = значение поля "id" внутри JSON
+    """
+    configs: Dict[str, Dict[str, Any]] = {}
+
+    if not TU_DIR.exists():
+        print(f"[WARN] Папка с ТУ {TU_DIR} не найдена")
+        return configs
+
+    for p in TU_DIR.glob("*.json"):
+        try:
+            with p.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            print(f"[WARN] Ошибка чтения ТУ {p}: {e}")
+            continue
+
+        tu_id = str(data.get("id") or p.stem)
+        meta_name = f"ТУ {tu_id}"
+
+        configs[tu_id] = {
+            "meta": {
+                "id": tu_id,
+                "name": meta_name,
+                "file": str(p),
+            },
+            "data": data,
+        }
+
+    return configs
+
+
+ALL_TU_CONFIGS = load_all_tu_configs()
+
+DEFAULT_TU_ID = os.getenv("TU_ID")
+if DEFAULT_TU_ID not in ALL_TU_CONFIGS and ALL_TU_CONFIGS:
+    DEFAULT_TU_ID = next(iter(ALL_TU_CONFIGS))  # первый попавшийся
 
 
 # ---------- 1. Общее состояние пайплайна ----------
@@ -21,6 +74,9 @@ class AppState(TypedDict, total=False):
     file_path: str
     file_ext: str
     file_bytes: bytes
+
+    # Выбранное ТУ
+    tu_id: str  # например "3667-013-05608841-2020"
 
     # Текст документа
     raw_text: str
@@ -35,74 +91,76 @@ class AppState(TypedDict, total=False):
     messages: List[str]
 
 
-# ---------- 2. Модель заявки (нейтральная) ----------
+# ---------- 2. Модель заявки (НЭМС) ----------
 
 
 class RequestFieldsModel(BaseModel):
-    """Что хотим вытащить из заявки (общая схема)."""
+    """Параметры НЭМС из ТУ, в терминах обозначения."""
 
-    customer_name: Optional[str] = Field(
-        None, description="Имя или организация клиента"
+    dn_mm: Optional[int] = Field(
+        None,
+        description="Наружный диаметр патрубков Дн, мм (в обозначении: второе поле, например 325)",
     )
-    project_name: Optional[str] = Field(
-        None, description="Название проекта / объекта"
+    pressure_kgf_cm2: Optional[float] = Field(
+        None,
+        description="Рабочее давление, кгс/см² (третье поле обозначения, например 40)",
     )
-    product_type: Optional[str] = Field(
-        None, description="Тип изделия, например 'задвижка', 'муфта', 'кран'"
+    length_mm: Optional[int] = Field(
+        None,
+        description="Длина изделия, мм (четвёртое поле обозначения, например 800)",
     )
-    medium: Optional[str] = Field(
-        None, description="Транспортируемая среда, например 'газ', 'нефть'"
+    medium_code: Optional[str] = Field(
+        None,
+        description="Код среды, например 'ВД' — техническая или питьевая вода (пятое поле обозначения)",
     )
-    pressure: Optional[str] = Field(
-        None, description="Давление (строка из заявки: МПа, кгс/см2 и т.п.)"
+    placement_code: Optional[str] = Field(
+        None,
+        description="Код места размещения на трубопроводе (первая цифра в группе '1-2' и т.п.)",
     )
-    diameter: Optional[str] = Field(
-        None, description="Диаметр / типоразмер, например 'DN50', '159x6'"
+    connection_code: Optional[str] = Field(
+        None,
+        description="Код типа соединения с трубопроводом (вторая цифра в группе '1-2', например сварка с наконечником)",
     )
-    temperature: Optional[str] = Field(
-        None, description="Температура среды или диапазон"
+    inner_coating_code: Optional[str] = Field(
+        None,
+        description="Код внутреннего защитного покрытия (первая цифра в группе '4-3')",
     )
-    installation_type: Optional[str] = Field(
-        None, description="Место установки, например 'подземная', 'надземная'"
+    outer_coating_code: Optional[str] = Field(
+        None,
+        description="Код наружного защитного покрытия (вторая цифра в группе '4-3')",
     )
-    connection_type: Optional[str] = Field(
-        None, description="Тип присоединения: фланцевое, сварное, резьбовое и т.п."
+    terminals_code: Optional[str] = Field(
+        None,
+        description="Признак установки клемм (например, 'К' — клеммы установлены, пусто — без клемм)",
     )
-    coatings: Optional[str] = Field(
-        None, description="Требования к покрытию (внутреннее/наружное)"
+    climate_code: Optional[str] = Field(
+        None,
+        description="Климатическое исполнение по ГОСТ 15150 (например, 'У1', 'УД')",
     )
-    climate: Optional[str] = Field(
-        None, description="Климатическое исполнение или диапазон температур окружающей среды"
-    )
-    quantity: Optional[int] = Field(
-        None, description="Количество единиц продукции"
-    )
-    extra_requirements: Optional[str] = Field(
-        None, description="Дополнительные требования и комментарии"
+    notes: Optional[str] = Field(
+        None,
+        description="Дополнительные требования / комментарии из заявки",
     )
 
 
 @dataclass
 class RequestFields:
-    customer_name: Optional[str] = None
-    project_name: Optional[str] = None
-    product_type: Optional[str] = None
-    medium: Optional[str] = None
-    pressure: Optional[str] = None
-    diameter: Optional[str] = None
-    temperature: Optional[str] = None
-    installation_type: Optional[str] = None
-    connection_type: Optional[str] = None
-    coatings: Optional[str] = None
-    climate: Optional[str] = None
-    quantity: Optional[int] = None
-    extra_requirements: Optional[str] = None
+    dn_mm: Optional[int] = None
+    pressure_kgf_cm2: Optional[float] = None
+    length_mm: Optional[int] = None
+    medium_code: Optional[str] = None
+    placement_code: Optional[str] = None
+    connection_code: Optional[str] = None
+    inner_coating_code: Optional[str] = None
+    outer_coating_code: Optional[str] = None
+    terminals_code: Optional[str] = None
+    climate_code: Optional[str] = None
+    notes: Optional[str] = None
 
 
 # ---------- 3. LLM (LangChain) ----------
 
-# OPENAI_API_KEY берётся из ENV
-load_dotenv() 
+load_dotenv()
 api_key = os.getenv("OPENAI_API_KEY") or os.getenv("GPT_API_KEY")
 if not api_key:
     raise RuntimeError(
@@ -111,7 +169,7 @@ if not api_key:
     )
 
 llm = ChatOpenAI(
-    model="gpt-4o-mini",   # или другую модель, которую ты используешь
+    model="gpt-4o-mini",
     temperature=0.1,
     api_key=api_key,
 )
@@ -119,7 +177,7 @@ llm = ChatOpenAI(
 structured_llm = llm.with_structured_output(RequestFieldsModel)
 
 
-# ---------- 4. Утилиты (OCR/парсинг — пока заглушки) ----------
+# ---------- 4. Утилиты (OCR/парсинг) ----------
 
 
 def add_msg(state: AppState, text: str) -> None:
@@ -135,13 +193,66 @@ def read_file_bytes(path: str) -> bytes:
 
 def extract_text_from_file(path: str, ext: str, data: bytes) -> str:
     """
-    Сюда потом можно вкрутить реальный OCR+парсинг:
-    - .docx → python-docx
-    - .xlsx → pandas/openpyxl
-    - .pdf/.jpg/.png → внешний OCR-сервис (ключи в ENV).
-    Сейчас — stub.
+    Унифицированное извлечение текста из файла:
+
+    - PNG/JPEG/PDF → Яндекс OCR
+    - DOCX → python-docx (параграфы + таблицы)
+    - XLS/XLSX → pandas (склеиваем все листы)
+    - остальное → пытаемся прочитать как текст
     """
-    return f"(stub) text extracted from file {Path(path).name} (ext={ext}), size={len(data)} bytes"
+    p = Path(path)
+    ext = ext.lower()
+
+    try:
+        # 1) Картинки и PDF — через Яндекс OCR
+        if ext in [".png", ".jpg", ".jpeg", ".pdf"]:
+            return recognize_file_to_text(str(p))
+
+        # 2) DOCX — читаем текст и таблицы
+        if ext == ".docx":
+            doc = Document(path)
+            parts: List[str] = []
+
+            for para in doc.paragraphs:
+                t = para.text.strip()
+                if t:
+                    parts.append(t)
+
+            for table in doc.tables:
+                for row in table.rows:
+                    cells = [cell.text.strip() for cell in row.cells]
+                    row_text = "\t".join(c for c in cells if c)
+                    if row_text:
+                        parts.append(row_text)
+
+            return "\n".join(parts)
+
+        # 3) Excel — читаем все листы и склеиваем
+        if ext in [".xls", ".xlsx"]:
+            sheets = pd.read_excel(path, sheet_name=None)
+            blocks: List[str] = []
+            for sheet_name, df in sheets.items():
+                blocks.append(f"### {sheet_name}")
+                blocks.append(df.to_string(index=False))
+            return "\n\n".join(blocks)
+
+        # 4) Старый .doc — лучше конвертить в PDF/Docx до загрузки
+        if ext == ".doc":
+            raise YandexOcrError(
+                ".doc сейчас не поддерживается. "
+                "Попроси клиента прислать PDF или DOCX."
+            )
+
+        # 5) Фолбэк — пробуем декоднуть байты как текст
+        return data.decode("utf-8", errors="ignore")
+
+    except YandexOcrError as e:
+        print(f"[Yandex OCR] {e}")
+        return ""
+
+    except Exception as e:
+        print(f"[extract_text_from_file error] {e}")
+        return ""
 
 
 def classify_document(text: str) -> str:
@@ -171,21 +282,42 @@ def classify_document(text: str) -> str:
 
 def match_with_catalog(fields: RequestFields) -> List[Dict[str, Any]]:
     """
-    Заглушка сопоставления с базой ТУ / 1С.
-    Потом здесь можно делать SQL/REST в 1С или поиск по своему каталогу.
-    Сейчас просто возвращаем один фиктивный вариант.
+    Заглушка сопоставления для НЭМС.
+    Сейчас просто собираем читаемое описание из полей и возвращаем один вариант.
     """
+    desc_parts: List[str] = []
+
+    if fields.dn_mm is not None:
+        desc_parts.append(f"Дн {fields.dn_mm} мм")
+    if fields.pressure_kgf_cm2 is not None:
+        desc_parts.append(f"PN {fields.pressure_kgf_cm2} кгс/см²")
+    if fields.length_mm is not None:
+        desc_parts.append(f"L={fields.length_mm} мм")
+    if fields.medium_code:
+        desc_parts.append(f"среда {fields.medium_code}")
+    if fields.placement_code:
+        desc_parts.append(f"размещение {fields.placement_code}")
+    if fields.connection_code:
+        desc_parts.append(f"соединение {fields.connection_code}")
+    if fields.inner_coating_code:
+        desc_parts.append(f"внутр. покрытие {fields.inner_coating_code}")
+    if fields.outer_coating_code:
+        desc_parts.append(f"наруж. покрытие {fields.outer_coating_code}")
+    if fields.terminals_code:
+        desc_parts.append(f"клеммы {fields.terminals_code}")
+    if fields.climate_code:
+        desc_parts.append(f"климат {fields.climate_code}")
+
+    name = "НЭМС"
+    if desc_parts:
+        name += " (" + ", ".join(desc_parts) + ")"
+
     return [
         {
-            "item_code": "ITEM-001",
-            "name": f"Подходящее изделие для {fields.product_type or 'изделия'}",
+            "item_code": "NEMS-PLACEHOLDER",
+            "name": name,
             "score": 0.8,
-            "matched_fields": {
-                "product_type": fields.product_type,
-                "medium": fields.medium,
-                "pressure": fields.pressure,
-                "diameter": fields.diameter,
-            },
+            "matched_fields": asdict(fields),
         }
     ]
 
@@ -228,6 +360,9 @@ def text_extraction_node(state: AppState) -> AppState:
     text = extract_text_from_file(path, ext, data)
     state["raw_text"] = text
     add_msg(state, f"[text_extraction] Extracted text of length {len(text)} chars.")
+    # 👇 логируем превью распознанного текста (OCR / парсинг)
+    preview = text[:500].replace("\n", " ")
+    add_msg(state, f"[text_extraction][preview] {preview}")
     return state
 
 
@@ -246,16 +381,34 @@ def field_extraction_node(state: AppState) -> AppState:
 
     text = state.get("raw_text", "")
 
+    # Берём ТУ: либо из состояния (state["tu_id"]), либо дефолтный
+    tu_id = state.get("tu_id") or DEFAULT_TU_ID
+    tu_cfg = ALL_TU_CONFIGS.get(tu_id)
+
+    if not tu_cfg:
+        add_msg(state, f"[field_extraction] TU config '{tu_id}' не найден, работаю без ТУ.")
+        tu_json_for_prompt = "{}"
+    else:
+        tu_json_for_prompt = json.dumps(tu_cfg["data"], ensure_ascii=False, indent=2)
+
     system_msg = SystemMessage(
         content=(
-            "Ты извлекаешь параметры заявки клиента на техническое оборудование "
-            "в структурированный формат. Ничего не выдумывай: если параметра нет, "
-            "оставляй null."
+            "Ты извлекаешь параметры НЭМС (неразъемное электроизолирующее муфтовое соединение) "
+            "из опросного листа/заявки и приводишь их к структуре RequestFieldsModel.\n\n"
+            f"Используй в качестве справочника следующие технические условия (ТУ {tu_id}) в формате JSON:\n"
+            f"{tu_json_for_prompt}\n\n"
+            "Правила:\n"
+            "1. Ничего не придумывай — если параметр не указан и не выводится однозначно из ТУ, оставляй null.\n"
+            "2. Если давление указано в МПа, можешь подобрать ближайший класс из pressure_classes.\n"
+            "3. Если указана среда, сопоставь её с кодом из product_types (МГ, РС, НП, ВД, ТС и т.п.).\n"
+            "4. Если указаны явные коды (ВД, У1, цифры покрытий и др.), используй их как есть, сверяясь с JSON ТУ.\n"
         )
     )
+
     user_msg = HumanMessage(
         content=(
-            "Вот текст заявки. Заполни схему RequestFieldsModel.\n\n"
+            "Вот текст опросного листа/заявки. "
+            "Заполни схему RequestFieldsModel, используя JSON с техническими условиями выше.\n\n"
             + text[:6000]
         )
     )
@@ -263,7 +416,11 @@ def field_extraction_node(state: AppState) -> AppState:
     result: RequestFieldsModel = structured_llm.invoke([system_msg, user_msg])
     fields = RequestFields(**result.dict())
     state["request_fields"] = asdict(fields)
-    add_msg(state, "[field_extraction] Extracted request fields: " + json.dumps(asdict(fields), ensure_ascii=False))
+    add_msg(
+        state,
+        "[field_extraction] Extracted request fields: "
+        + json.dumps(asdict(fields), ensure_ascii=False),
+    )
     return state
 
 
@@ -319,11 +476,12 @@ def build_processing_graph():
 
 if __name__ == "__main__":
     graph = build_processing_graph()
-    example_path = "uploads/example_request.pdf"  # подставь свой путь
+    example_path = "uploads/example.png"  # подставь свой путь
 
     init_state: AppState = {
         "file_path": example_path,
         "messages": [],
+        # "tu_id": "3667-013-05608841-2020",  # можно указать явно
     }
 
     final_state = graph.invoke(init_state)

@@ -5,12 +5,18 @@ import io
 import json
 import uuid
 from pathlib import Path
+from typing import List, Dict
 
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
-from processing_graph import build_processing_graph, RequestFields
+from processing_graph import (
+    build_processing_graph,
+    RequestFields,
+    ALL_TU_CONFIGS,
+    DEFAULT_TU_ID,
+)
 
 # Компилируем граф один раз при старте
 GRAPH = build_processing_graph()
@@ -32,7 +38,7 @@ def save_uploaded_file(uploaded, dest_dir: str = "uploads") -> str:
     return str(path)
 
 
-def save_submission(image_path: str, fields: list[str], csv_path: str = "submissions.csv") -> None:
+def save_submission(image_path: str, fields: List[str], csv_path: str = "submissions.csv") -> None:
     header = ["timestamp", "image"] + [f"field_{i+1}" for i in range(11)] + ["joined"]
     exists = Path(csv_path).exists()
     with open(csv_path, "a", newline="", encoding="utf-8") as f:
@@ -46,7 +52,7 @@ def save_submission(image_path: str, fields: list[str], csv_path: str = "submiss
         writer.writerow(row)
 
 
-def read_submissions(csv_path: str = "submissions.csv") -> list[dict]:
+def read_submissions(csv_path: str = "submissions.csv") -> List[Dict]:
     if not Path(csv_path).exists():
         return []
     with open(csv_path, newline="", encoding="utf-8") as f:
@@ -54,21 +60,21 @@ def read_submissions(csv_path: str = "submissions.csv") -> list[dict]:
         return list(reader)
 
 
-def request_fields_to_ui_list(fields_dict: dict) -> list[str]:
-    """Маппим RequestFields → 11 строк для полей UI."""
+def request_fields_to_ui_list(fields_dict: dict) -> List[str]:
+    """Маппим RequestFields (НЭМС) → 11 строк для полей UI."""
     rf = RequestFields(**fields_dict) if fields_dict else RequestFields()
-    res: list[str] = [
-        rf.customer_name or "",            # 1
-        rf.project_name or "",             # 2
-        rf.product_type or "",             # 3
-        rf.medium or "",                   # 4
-        rf.pressure or "",                 # 5
-        rf.diameter or "",                 # 6
-        rf.temperature or "",              # 7
-        rf.installation_type or "",        # 8
-        rf.connection_type or "",          # 9
-        rf.coatings or "",                 # 10
-        (rf.climate or "") + (f", qty={rf.quantity}" if rf.quantity is not None else ""),  # 11
+    res: List[str] = [
+        str(rf.dn_mm or ""),              # 1 Дн, мм
+        str(rf.pressure_kgf_cm2 or ""),   # 2 Давление, кгс/см²
+        str(rf.length_mm or ""),          # 3 Длина, мм
+        rf.medium_code or "",             # 4 Код среды
+        rf.placement_code or "",          # 5 Код размещения
+        rf.connection_code or "",         # 6 Код соединения
+        rf.inner_coating_code or "",      # 7 Код внутр. покрытия
+        rf.outer_coating_code or "",      # 8 Код нар. покрытия
+        rf.terminals_code or "",          # 9 Клеммы (К/пусто)
+        rf.climate_code or "",            # 10 Климат. код
+        rf.notes or "",                   # 11 Примечания
     ]
     return res
 
@@ -121,6 +127,35 @@ def main() -> None:
     # ------------- Вкладка: Форма загрузки -------------
 
     with tab_upload:
+        # --- выбор технических условий (ТУ) ---
+        selected_tu_id = None
+        if ALL_TU_CONFIGS:
+            tu_names = {
+                cfg["meta"].get("name", tu_id): tu_id
+                for tu_id, cfg in ALL_TU_CONFIGS.items()
+            }
+            tu_name_list = list(tu_names.keys())
+
+            # выбираем дефолт по DEFAULT_TU_ID
+            try:
+                default_name = next(
+                    name for name, tid in tu_names.items() if tid == DEFAULT_TU_ID
+                )
+                default_index = tu_name_list.index(default_name)
+            except StopIteration:
+                default_index = 0
+
+            selected_name = st.selectbox(
+                "Технические условия (ТУ):",
+                options=tu_name_list,
+                index=default_index,
+            )
+            selected_tu_id = tu_names[selected_name]
+            st.session_state["selected_tu_id"] = selected_tu_id
+        else:
+            st.warning("Не найдены файлы ТУ в папке tu/. Обработка будет без привязки к ТУ.")
+            st.session_state["selected_tu_id"] = None
+
         st.header("1️⃣ Загрузите файл заявки")
         uploaded = st.file_uploader(
             "Выберите файл (png/jpg/jpeg/pdf/docx/xlsx)",
@@ -142,13 +177,17 @@ def main() -> None:
                         with open(saved_path, "rb") as f:
                             pdf_bytes = f.read()
                         b64 = base64.b64encode(pdf_bytes).decode("utf-8")
-                        pdf_display = f"<iframe src='data:application/pdf;base64,{b64}' width='100%' height='600' style='border: none;'></iframe>"
+                        pdf_display = (
+                            f"<iframe src='data:application/pdf;base64,{b64}' "
+                            "width='100%' height='600' style='border: none;'></iframe>"
+                        )
                         components.html(pdf_display, height=600)
                     except Exception:
                         st.info(f"Загружен PDF: {Path(saved_path).name}")
                 elif suffix == ".docx":
                     try:
                         from docx import Document
+
                         doc = Document(saved_path)
                         text = "\n".join([p.text for p in doc.paragraphs if p.text])
                         if text:
@@ -181,7 +220,7 @@ def main() -> None:
                 st.error(f"Не удалось сохранить файл: {e}")
 
         st.write("---")
-        st.subheader("2️⃣ Параметры заявки (11 полей)")
+        st.subheader("2️⃣ Параметры НЭМС (11 полей)")
 
         st.write(
             "AI будет пытаться заполнить их автоматически из файла, "
@@ -189,20 +228,20 @@ def main() -> None:
         )
 
         # Инициализация 11 полей
-        fields: list[str] = []
+        fields: List[str] = []
         cols = st.columns(11)
         labels = [
-            "Клиент",
-            "Проект",
-            "Тип изделия",
-            "Среда",
-            "Давление",
-            "Диаметр",
-            "Температура",
-            "Установка",
-            "Присоединение",
-            "Покрытия",
-            "Климат / qty",
+            "Дн, мм",
+            "Давление, кгс/см²",
+            "Длина, мм",
+            "Код среды",
+            "Код размещения",
+            "Код соединения",
+            "Код внутр. покрытия",
+            "Код нар. покрытия",
+            "Клеммы (К/пусто)",
+            "Климат. код",
+            "Примечания",
         ]
         for i, col in enumerate(cols):
             key = f"field_{i+1}"
@@ -234,7 +273,6 @@ def main() -> None:
 
         if "processing_error" in st.session_state:
             st.error(st.session_state["processing_error"])
-            # очищаем после показа
             st.session_state.pop("processing_error", None)
 
         def _fill_from_ai() -> None:
@@ -248,6 +286,11 @@ def main() -> None:
                     "file_path": path,
                     "messages": [],
                 }
+
+                tu_id = st.session_state.get("selected_tu_id")
+                if tu_id:
+                    state["tu_id"] = tu_id
+
                 result = GRAPH.invoke(state)
                 result.pop("file_bytes", None)
                 st.session_state["processing_result"] = result
@@ -266,7 +309,7 @@ def main() -> None:
         )
 
         if "processing_result" in st.session_state:
-            st.markdown("**Результат мультиагентной обработки:**")
+            st.markdown("**Результат мультиагентной обработки (включая логи OCR):**")
             st.json(st.session_state["processing_result"])
 
         # Отправка заявки
@@ -274,7 +317,6 @@ def main() -> None:
         st.subheader("4️⃣ Сохранить заявку")
 
         if st.button("Отправить заявку"):
-            # берём последний сохранённый путь или из сессии
             img_path = saved_path or st.session_state.get("last_uploaded_path")
             if not img_path:
                 st.error("Пожалуйста, загрузите файл перед отправкой.")
@@ -286,7 +328,6 @@ def main() -> None:
                     collected = [v if v is not None else "" for v in collected]
                     save_submission(img_path, collected)
                     st.success("Заявка сохранена.")
-                    # очистим поля для следующей
                     for i in range(11):
                         st.session_state.pop(f"field_{i+1}", None)
                 except Exception as e:
