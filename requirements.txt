@@ -1,0 +1,9 @@
+streamlit
+pandas
+openpyxl
+python-docx
+
+langgraph
+langchain-core
+langchain-openai
+pydantic
