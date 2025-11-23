@@ -13,11 +13,6 @@ from pydantic import BaseModel, Field
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_openai import ChatOpenAI
 
-import pandas as pd
-from docx import Document
-
-from yandex_ocr_client import recognize_file_to_text, YandexOcrError
-
 
 # ---------- 0. Загрузка ТУ ----------
 
@@ -80,7 +75,6 @@ class AppState(TypedDict, total=False):
 
     # Текст документа
     raw_text: str
-    doc_type: str  # "questionnaire" / "spec" / "other"
 
     # Структурированная заявка
     request_fields: Dict[str, Any]      # как вернул LLM
@@ -200,6 +194,10 @@ def extract_text_from_file(path: str, ext: str, data: bytes) -> str:
     - XLS/XLSX → pandas (склеиваем все листы)
     - остальное → пытаемся прочитать как текст
     """
+    from docx import Document
+    import pandas as pd
+    from yandex_ocr_client import recognize_file_to_text, YandexOcrError
+    
     p = Path(path)
     ext = ext.lower()
 
@@ -246,38 +244,9 @@ def extract_text_from_file(path: str, ext: str, data: bytes) -> str:
         # 5) Фолбэк — пробуем декоднуть байты как текст
         return data.decode("utf-8", errors="ignore")
 
-    except YandexOcrError as e:
-        print(f"[Yandex OCR] {e}")
-        return ""
-
     except Exception as e:
         print(f"[extract_text_from_file error] {e}")
         return ""
-
-
-def classify_document(text: str) -> str:
-    """
-    LLM-классификация: опросный лист / тех.описание / другое.
-    """
-    messages = [
-        SystemMessage(
-            content=(
-                "Ты классифицируешь тип инженерного документа. "
-                "Если документ похож на опросный лист заказчика "
-                "(таблица параметров, поля для заполнения, запрос на подбор оборудования), "
-                "ответь 'questionnaire'. Если это техническое описание продукции "
-                "или ТУ, ответь 'spec'. Иначе ответь 'other'."
-            )
-        ),
-        HumanMessage(content=text[:4000]),
-    ]
-    resp = llm.invoke(messages)
-    ans = resp.content.strip().lower()
-    if "questionnaire" in ans:
-        return "questionnaire"
-    if "spec" in ans:
-        return "spec"
-    return "other"
 
 
 def match_with_catalog(fields: RequestFields) -> List[Dict[str, Any]]:
@@ -366,19 +335,7 @@ def text_extraction_node(state: AppState) -> AppState:
     return state
 
 
-def doc_classifier_node(state: AppState) -> AppState:
-    text = state.get("raw_text", "")
-    doc_type = classify_document(text)
-    state["doc_type"] = doc_type
-    add_msg(state, f"[doc_classifier] Document type: {doc_type}.")
-    return state
-
-
 def field_extraction_node(state: AppState) -> AppState:
-    if state.get("doc_type") != "questionnaire":
-        add_msg(state, "[field_extraction] Document is not a questionnaire, skipping extraction.")
-        return state
-
     text = state.get("raw_text", "")
 
     # Берём ТУ: либо из состояния (state["tu_id"]), либо дефолтный
@@ -455,7 +412,6 @@ def build_processing_graph():
 
     workflow.add_node("file_ingestion", file_ingestion_node)
     workflow.add_node("text_extraction", text_extraction_node)
-    workflow.add_node("doc_classifier", doc_classifier_node)
     workflow.add_node("field_extraction", field_extraction_node)
     workflow.add_node("matching", matching_node)
     workflow.add_node("export", export_node)
@@ -463,8 +419,7 @@ def build_processing_graph():
     workflow.set_entry_point("file_ingestion")
 
     workflow.add_edge("file_ingestion", "text_extraction")
-    workflow.add_edge("text_extraction", "doc_classifier")
-    workflow.add_edge("doc_classifier", "field_extraction")
+    workflow.add_edge("text_extraction", "field_extraction")
     workflow.add_edge("field_extraction", "matching")
     workflow.add_edge("matching", "export")
     workflow.add_edge("export", END)
